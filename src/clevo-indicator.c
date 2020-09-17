@@ -72,10 +72,10 @@
 #define EC_REG_CPU_TEMP 0x07
 #define EC_REG_CPU_FAN_RPMS_HI 0xD0
 #define EC_REG_CPU_FAN_RPMS_LO 0xD1
+#define EC_REG_GPU_FAN_DUTY 0xCF
+#define EC_REG_GPU_TEMP 0xCD
 #define EC_REG_GPU_FAN_RPMS_HI 0xD2
 #define EC_REG_GPU_FAN_RPMS_LO 0xD3
-#define EC_REG_GPU_TEMP 0xCD
-#define EC_REG_GPU_FAN_DUTY 0xCF
 
 #define MAX_FAN_RPM 4400.0
 
@@ -96,6 +96,7 @@ static void main_on_sigterm(int signum);
 static int main_dump_fan(void);
 static int main_test_cpu_fan(int duty_percentage);
 static int main_test_gpu_fan(int duty_percentage);
+static int main_test_gpu2_fan(int duty_percentage);
 static gboolean ui_update(gpointer user_data);
 static void ui_command_set_fan(long fan_duty);
 static void ui_command_quit(gchar* command);
@@ -111,6 +112,7 @@ static int ec_query_gpu_fan_duty(void);
 static int ec_query_gpu_fan_rpms(void);
 static int ec_write_cpu_fan_duty(int duty_percentage);
 static int ec_write_gpu_fan_duty(int duty_percentage);
+static int ec_write_gpu2_fan_duty(int duty_percentage);
 static int ec_io_wait(const uint32_t port, const uint32_t flag,
         const char value);
 static uint8_t ec_io_read(const uint32_t port);
@@ -166,7 +168,7 @@ void autoset_cpu_gpu()
     if (sched_setscheduler(0, SCHED_FIFO, & param) != 0)
     {
         printf("sched_setscheduler error\n");
-        exit(EXIT_FAILURE);  
+        exit(EXIT_FAILURE);
     }
 
     int initial = 1;
@@ -189,17 +191,18 @@ void autoset_cpu_gpu()
     static int ctrl_setting_min_gpu = 0;
     static int ctrl_setting_force_cpu = -1;
     static int ctrl_setting_force_gpu = -1;
-    
+
     while (1)
     {
         //printf("Checking\n");
         if (missing > 5)
         {
-            ec_write_gpu_fan_duty(70);
             ec_write_cpu_fan_duty(70);
+            ec_write_gpu_fan_duty(70);
+            ec_write_gpu2_fan_duty(70);
             exit(1);
         }
-        
+
         char buffer[10];
         double gputemp;
         int found = 0;
@@ -316,7 +319,7 @@ void autoset_cpu_gpu()
                 doSet[0] = doSet[1] = 1;
                 for (int i = 0;i < 2;i++) if (setDuty[i] < current[i]) setDuty[i] = current[i];
             }
-            
+
             if (cputemp < TEMP_FAIL_THRESHOLD || gputemp < TEMP_FAIL_THRESHOLD)
             {
                 if (lastfail >= 1)
@@ -337,7 +340,7 @@ void autoset_cpu_gpu()
             }
 
             printf("Temperatures C: %f G: %f --> %f %f --> New Duty: %d (%d) %d (%d) - Activate %d %d\n", cputemp, gputemp, avg[0], avg[1], setDuty[0], cur_cpu_setting, setDuty[1], cur_gpu_setting, doSet[0], doSet[1]);
-            
+
             for (int i = 0;i < 2;i++)
             {
                 if (doSet[i])
@@ -346,7 +349,10 @@ void autoset_cpu_gpu()
                     int retVal;
                     for (int j = 0;j < 3;j++)
                     {
-                        if (i) retVal = ec_write_gpu_fan_duty(setDuty[1]);
+                        if (i) {
+                            ec_write_gpu2_fan_duty(setDuty[1]);
+                            retVal = ec_write_gpu_fan_duty(setDuty[1]);
+                        }
                         else retVal = ec_write_cpu_fan_duty(setDuty[0]);
                         if (retVal == EXIT_SUCCESS)
                         {
@@ -475,6 +481,19 @@ DO NOT MANIPULATE OR QUERY EC I/O PORTS WHILE THIS PROGRAM IS RUNNING.\n\
                 return EXIT_FAILURE;
             }
             return main_test_gpu_fan(val);
+        }
+    } else if (strcmp(argv[1], "setg2") == 0) {
+        if (argc < 2) {
+            printf("Missing argument\n");
+            return EXIT_FAILURE;
+        } else {
+            int val = atoi(argv[2]);
+            if (val < 0 || val > 100)
+                    {
+                printf("invalid fan duty %d!\n", val);
+                return EXIT_FAILURE;
+            }
+            return main_test_gpu2_fan(val);
         }
     } else if (strcmp(argv[1], "dump") == 0) {
         return main_dump_fan();
@@ -691,12 +710,21 @@ static int main_test_cpu_fan(int duty_percentage) {
 }
 
 static int main_test_gpu_fan(int duty_percentage) {
-    printf("Change fan duty to %d%%\n", duty_percentage);
+    printf("Change gpu fan duty to %d%%\n", duty_percentage);
     ec_write_gpu_fan_duty(duty_percentage);
     printf("\n");
     main_dump_fan();
     return EXIT_SUCCESS;
 }
+
+static int main_test_gpu2_fan(int duty_percentage) {
+    printf("Change gpu2 fan duty to %d%%\n", duty_percentage);
+    ec_write_gpu2_fan_duty(duty_percentage);
+    printf("\n");
+    main_dump_fan();
+    return EXIT_SUCCESS;
+}
+
 
 static gboolean ui_update(gpointer user_data) {
     char label[256];
@@ -933,6 +961,27 @@ static int ec_write_gpu_fan_duty(int duty_percentage) {
         return 0;
     }
     return ec_io_do(0x99, 0x02, v_i);
+}
+
+static int ec_write_gpu2_fan_duty(int duty_percentage) {
+    if (duty_percentage < 0 || duty_percentage > 100) {
+        printf("Wrong fan duty to write: %d\n", duty_percentage);
+        return EXIT_FAILURE;
+    }
+    double v_d = ((double) duty_percentage) / 100.0 * 255.0 + 0.5;
+    int v_i = (int) v_d;
+    if (use_hwmon_interface)
+    {
+        char name[1024];
+        sprintf(name, "/sys/class/hwmon/hwmon%d/pwm3", hwmon_interface_num);
+        FILE* fp;
+        fp = fopen(name, "wb");
+        if (fp == 0) return 99;
+        fprintf(fp, "%d\n", v_i);
+        fclose(fp);
+        return 0;
+    }
+    return ec_io_do(0x99, 0x03, v_i);
 }
 
 static int ec_io_wait(const uint32_t port, const uint32_t flag,
